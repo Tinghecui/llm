@@ -33,36 +33,125 @@ x-stainless-timeout: 600
 x-stainless-retry-count: 0
 ```
 
-### 3. 请求日志
+### 3. 健康检查请求 Mock
+自动识别健康检查请求（9个特征全部匹配），返回模拟响应：
+
+**识别特征（全部满足）：**
+
+| 类型 | 特征 |
+|------|------|
+| Headers | `user-agent` 包含 `Go-http-client` |
+| Headers | 有 `x-api-key` |
+| Headers | 没有 `authorization` |
+| Body | `messages` 长度 = 1 |
+| Body | `content` = `"hi"` (字符串格式) |
+| Body | `tools` = `[]` 空数组 |
+| Body | 没有 `stream` 字段 |
+| Body | 没有 `metadata` 字段 |
+| Body | 没有 `system` 字段 |
+
+**Mock 响应：**
+- 延迟 2-4 秒（随机）
+- 返回 `"Hi! How can I help you today?"`
+- 响应头包含 `x-mock-response: true`
+
+### 4. R2 日志存储（训练数据收集）
+将请求和响应数据持久化存储到 Cloudflare R2：
+
+**存储条件：**
+- 只记录成功响应（status === 200）
+- 排除健康检查请求
+
+**存储的数据字段：**
+
+| 类型 | 字段 |
+|------|------|
+| 元数据 | `request_id`, `timestamp`, `latency`, `status` |
+| 请求 | `model`, `messages`, `system`, `max_tokens`, `temperature`, `thinking`, `tools`, `metadata`, `stream` |
+| 响应 | `content`, `stop_reason`, `usage.input_tokens`, `usage.output_tokens` |
+
+**存储路径：**
+```
+llm-logs/logs/{date}/{request_id}.json
+```
+
+**流式响应处理：**
+- 使用 `TransformStream` 拦截 SSE 流
+- 同步透传给客户端，不影响首字节延迟
+- 累积 `content_block_delta` 事件拼接完整输出
+- 从 `message_delta` 提取 `stop_reason` 和 `usage`
+- 使用 `ctx.waitUntil()` 异步写入 R2
+
+### 5. 请求日志
 - **实时日志 (console.log)**：记录完整请求信息（headers、body）
 - 使用 `npm run tail` 或 `wrangler tail --format=json` 查看
-- 日志类型：`FULL_REQUEST`（请求详情）、`RESPONSE`（响应状态）
+- 日志类型：
+  - `FULL_REQUEST` - 请求详情
+  - `RESPONSE` - 响应状态
+  - `HEALTH_CHECK_MOCK` - 健康检查被 mock
+  - `R2_SAVED` - R2 存储成功
+  - `R2_SAVE_ERROR` - R2 存储失败
 
 ---
 
-## 代码配置
+## 项目文件结构
 
-```javascript
-const CONFIG = {
-  TARGET_HOST: "anyrouter.top",
-  INJECT_HEADERS: {
-    "user-agent": "claude-cli/2.0.76 (external, cli)",
-    "anthropic-version": "2023-06-01",
-    "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27",
-    "anthropic-dangerous-direct-browser-access": "true",
-    "x-app": "cli",
-    "x-stainless-arch": "arm64",
-    "x-stainless-os": "MacOS",
-    "x-stainless-lang": "js",
-    "x-stainless-runtime": "node",
-    "x-stainless-runtime-version": "v24.3.0",
-    "x-stainless-package-version": "0.70.0",
-    "x-stainless-helper-method": "stream",
-    "x-stainless-timeout": "600",
-    "x-stainless-retry-count": "0"
-  }
-}
 ```
+llm-proxy/
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # GitHub Actions CI/CD
+├── src/
+│   └── index.js              # Worker 主代码
+├── test/
+│   └── index.test.js         # 单元测试
+├── scripts/
+│   └── replay-request.js     # 请求重放工具
+├── wrangler.toml             # Cloudflare 配置
+├── vitest.config.js          # 测试配置
+├── package.json              # npm 脚本
+└── CLAUDE.md                 # 本文件
+```
+
+---
+
+## 命令行操作
+
+```bash
+# 安装依赖
+npm install
+
+# 本地开发测试
+npm run dev
+
+# 运行测试
+npm test
+npm run test:watch    # 监听模式
+
+# 部署到 Cloudflare
+npm run deploy
+
+# 查看实时日志
+npm run tail
+npm run tail -- --format=json              # JSON 格式
+npm run tail -- --format=json | grep FULL  # 只看请求
+
+# R2 日志管理
+npx wrangler r2 object list llm-logs                              # 列出文件
+npx wrangler r2 object get llm-logs logs/2025-12-25/{id}.json    # 下载文件
+```
+
+---
+
+## CI/CD
+
+GitHub Actions 自动化流程（`.github/workflows/ci.yml`）：
+
+1. **测试**：每次 push/PR 自动运行 vitest 测试
+2. **部署**：main 分支测试通过后自动部署到 Cloudflare Workers
+
+**需要配置的 Secrets：**
+- `CLOUDFLARE_API_TOKEN` - Cloudflare API Token（需要 Workers 和 R2 权限）
 
 ---
 
@@ -92,89 +181,77 @@ const CONFIG = {
 }
 ```
 
+### R2 存储数据格式
+```json
+{
+  "request_id": "uuid",
+  "timestamp": "2025-12-25T20:00:00.000Z",
+  "latency": 1234,
+  "status": 200,
+  "request": {
+    "model": "claude-opus-4-5-20251101",
+    "messages": [...],
+    "system": [...],
+    "max_tokens": 32000,
+    "temperature": null,
+    "thinking": null,
+    "tools": [],
+    "metadata": { "user_id": "..." },
+    "stream": true
+  },
+  "response": {
+    "content": [{ "type": "text", "text": "..." }],
+    "stop_reason": "end_turn",
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 50
+    }
+  }
+}
+```
+
 ---
 
 ## 客户端特征对比
 
-| 特征 | Claude CLI | Go 客户端 |
-|------|-----------|-----------|
-| `user-agent` | `claude-cli/2.0.76 (external, cli)` | `Go-http-client/1.1` |
-| `anthropic-beta` | 含 `claude-code-20250219` | 不含 |
+| 特征 | Claude CLI | Go 客户端（健康检查） |
+|------|-----------|----------------------|
+| `user-agent` | `claude-cli/2.0.76` | `Go-http-client/2.0` |
+| `authorization` | Bearer token | 无 |
+| `x-api-key` | 无 | 有 |
+| `anthropic-beta` | 有 | 无 |
 | `x-stainless-*` | 全部有 | 无 |
-| `x-app` | `cli` | 无 |
-| `stream` | `true` | 无/null |
-| `thinking` | 有 | 无 |
-| `temperature` | 无 | `1` |
-
----
-
-## 项目文件结构
-
-```
-llm-proxy/
-├── src/
-│   └── index.js              # Worker 主代码
-├── scripts/
-│   └── replay-request.js     # 请求重放工具
-├── wrangler.toml             # Cloudflare 配置
-├── package.json              # npm 脚本
-└── CLAUDE.md                 # 本文件
-```
-
----
-
-## 命令行操作
-
-```bash
-# 安装依赖
-npm install
-
-# 本地开发测试
-npm run dev
-
-# 部署到 Cloudflare
-npm run deploy
-
-# 查看实时日志（抓取请求）
-npm run tail
-npm run tail -- --format=json              # JSON 格式
-npm run tail -- --format=json | grep FULL  # 只看请求
-
-# 请求重放工具（需要 KV 有数据）
-npm run requests                           # 列出保存的请求
-npm run request:curl -- "<key>"            # 生成 curl 命令
-npm run request:fetch -- "<key>"           # 生成 fetch 代码
-npm run request:replay -- "<key>"          # 直接重放请求
-```
-
----
-
-## 抓取请求示例
-
-```bash
-# 抓取并保存到文件
-npx wrangler tail --format=json > requests.log
-
-# 提取 FULL_REQUEST
-cat requests.log | jq -r '.logs[]?.message[]?' | grep FULL_REQUEST
-
-# 解析请求详情
-cat requests.log | jq -r '.logs[]?.message[]?' | grep FULL_REQUEST | jq '.headers'
-```
+| `stream` | `true` | 无 |
+| `metadata` | 有 | 无 |
+| `system` | 有 | 无 |
 
 ---
 
 ## 注意事项
 
-1. **KV 配额限制**：Cloudflare 免费版每天只有 1000 次 KV 写入，已移除 KV 持久化，改用 console.log
-2. **重试机制已关闭**：`MAX_RETRIES = 0`，直接转发不重试
-3. **特征头注入**：所有请求都会被注入 Claude CLI 特征头
+1. **付费版 Worker**：建议升级到付费版（$5/月）获得 50ms CPU 时间，支持大响应的完整存储
+2. **R2 免费额度**：10GB 存储，100万次请求/月
+3. **流式响应**：使用 TransformStream 同步透传，不影响客户端延迟
+4. **健康检查 Mock**：返回延迟 2-4 秒，避免被检测为异常
 
 ---
 
 ## 更新历史
 
-### 2025-12-25
+### 2025-12-25 (v2)
+1. **添加健康检查请求识别和 Mock 响应**
+   - 9 个特征全部匹配才识别为健康检查
+   - 返回模拟响应，延迟 2-4 秒
+2. **添加 R2 日志存储**
+   - 存储请求和响应数据用于训练
+   - 支持流式响应的完整捕获
+   - 只记录成功响应
+3. **添加 CI/CD**
+   - vitest 单元测试
+   - GitHub Actions 自动测试和部署
+4. **添加 nodejs_compat 兼容性标志**
+
+### 2025-12-25 (v1)
 1. 移除 KV 错误日志（配额限制）
 2. 移除重试机制
 3. 添加完整请求日志到 console.log
