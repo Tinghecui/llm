@@ -107,6 +107,143 @@ function randomDelay() {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+// 保存到 R2
+async function saveToR2(env, data) {
+  const date = data.timestamp.split('T')[0]
+  const key = `logs/${date}/${data.request_id}.json`
+
+  try {
+    await env.LOGS_BUCKET.put(key, JSON.stringify(data), {
+      httpMetadata: { contentType: 'application/json' }
+    })
+    console.log(JSON.stringify({
+      type: 'R2_SAVED',
+      request_id: data.request_id,
+      key
+    }))
+  } catch (e) {
+    console.log(JSON.stringify({
+      type: 'R2_SAVE_ERROR',
+      request_id: data.request_id,
+      error: e.message
+    }))
+  }
+}
+
+// 合并相同类型的 content
+function mergeContent(chunks) {
+  const result = []
+  let currentText = ''
+  let currentThinking = ''
+
+  for (const chunk of chunks) {
+    if (chunk.type === 'text') {
+      currentText += chunk.text
+    } else if (chunk.type === 'thinking') {
+      currentThinking += chunk.thinking
+    }
+  }
+
+  if (currentThinking) {
+    result.push({ type: 'thinking', thinking: currentThinking })
+  }
+  if (currentText) {
+    result.push({ type: 'text', text: currentText })
+  }
+
+  return result
+}
+
+// 创建流式响应处理器
+function createStreamProcessor(requestId, bodyContent, startTime, env, ctx) {
+  let fullContent = []
+  let inputTokens = 0
+  let outputTokens = 0
+  let stopReason = null
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const transformer = new TransformStream({
+    transform(chunk, controller) {
+      // 直接透传给客户端
+      controller.enqueue(chunk)
+
+      // 同时解析 SSE 事件
+      buffer += decoder.decode(chunk, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6)
+          if (data === '[DONE]') continue
+
+          try {
+            const event = JSON.parse(data)
+
+            switch (event.type) {
+              case 'message_start':
+                inputTokens = event.message?.usage?.input_tokens || 0
+                break
+
+              case 'content_block_delta':
+                if (event.delta?.type === 'text_delta') {
+                  fullContent.push({
+                    type: 'text',
+                    text: event.delta.text
+                  })
+                } else if (event.delta?.type === 'thinking_delta') {
+                  fullContent.push({
+                    type: 'thinking',
+                    thinking: event.delta.thinking
+                  })
+                }
+                break
+
+              case 'message_delta':
+                stopReason = event.delta?.stop_reason
+                outputTokens = event.usage?.output_tokens || 0
+                break
+            }
+          } catch {}
+        }
+      }
+    },
+
+    flush(controller) {
+      // 流结束后，异步保存到 R2
+      ctx.waitUntil(saveToR2(env, {
+        request_id: requestId,
+        timestamp: new Date().toISOString(),
+        latency: Date.now() - startTime,
+        status: 200,
+        request: {
+          model: bodyContent.model,
+          messages: bodyContent.messages,
+          system: bodyContent.system,
+          max_tokens: bodyContent.max_tokens,
+          temperature: bodyContent.temperature,
+          thinking: bodyContent.thinking,
+          tools: bodyContent.tools,
+          metadata: bodyContent.metadata,
+          stream: bodyContent.stream
+        },
+        response: {
+          content: mergeContent(fullContent),
+          stop_reason: stopReason,
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: outputTokens
+          }
+        }
+      }))
+    }
+  })
+
+  return transformer
+}
+
 // 主入口
 export default {
   async fetch(request, env, ctx) {
@@ -183,6 +320,56 @@ export default {
       duration: Date.now() - startTime
     }))
 
+    // 只记录成功的响应（status === 200）
+    const shouldLog = response.status === 200
+
+    if (shouldLog && bodyContent?.stream === true) {
+      // 流式响应：使用 TransformStream 处理
+      const processor = createStreamProcessor(requestId, bodyContent, startTime, env, ctx)
+      const transformedBody = response.body.pipeThrough(processor)
+
+      return new Response(transformedBody, {
+        status: response.status,
+        headers: response.headers
+      })
+    } else if (shouldLog && bodyContent && typeof bodyContent === 'object') {
+      // 非流式响应：直接读取 body
+      const responseBody = await response.text()
+
+      try {
+        const responseData = JSON.parse(responseBody)
+
+        ctx.waitUntil(saveToR2(env, {
+          request_id: requestId,
+          timestamp: new Date().toISOString(),
+          latency: Date.now() - startTime,
+          status: response.status,
+          request: {
+            model: bodyContent.model,
+            messages: bodyContent.messages,
+            system: bodyContent.system,
+            max_tokens: bodyContent.max_tokens,
+            temperature: bodyContent.temperature,
+            thinking: bodyContent.thinking,
+            tools: bodyContent.tools,
+            metadata: bodyContent.metadata,
+            stream: bodyContent.stream
+          },
+          response: {
+            content: responseData.content,
+            stop_reason: responseData.stop_reason,
+            usage: responseData.usage
+          }
+        }))
+      } catch {}
+
+      return new Response(responseBody, {
+        status: response.status,
+        headers: response.headers
+      })
+    }
+
+    // 不需要存储的请求，直接返回
     return response
   }
 }
