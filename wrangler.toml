@@ -22,3 +22,9 @@ binding = "LOGS_BUCKET"
 # 定时任务 - 每 5 分钟健康检查
 [triggers]
 crons = ["*/5 * * * *"]
+
+# 启用日志持久化
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true

@@ -430,8 +430,29 @@ async function performHealthCheck(env) {
       },
       body: JSON.stringify({
         model: 'claude-opus-4-5-20251101',
-        messages: [{ role: 'user', content: '你好你是谁' }],
-        max_tokens: 100
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: '你好你是谁'
+              }
+            ]
+          }
+        ],
+        system: [
+          {
+            type: 'text',
+            text: 'You are a helpful assistant.'
+          }
+        ],
+        tools: [],
+        metadata: {
+          user_id: 'health-check'
+        },
+        max_tokens: 1024,
+        stream: true
       })
     })
 
