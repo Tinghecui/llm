@@ -1,0 +1,14 @@
+name = "llm-proxy"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# KV 绑定 - 需要替换为你的 namespace ID
+# 在 Dashboard 的 KV 页面可以找到
+kv_namespaces = [
+  { binding = "ERROR_LOGS", id = "d325ef9e98a8490b88ed3ea24004b7ef" }
+]
+
+# 路由配置（可选）
+# routes = [
+#   { pattern = "api.cthlwy.social/*", zone_name = "cthlwy.social" }
+# ]

@@ -1,0 +1,18 @@
+{
+  "name": "llm-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "requests": "node scripts/replay-request.js list",
+    "request:get": "node scripts/replay-request.js get",
+    "request:curl": "node scripts/replay-request.js curl",
+    "request:fetch": "node scripts/replay-request.js fetch",
+    "request:replay": "node scripts/replay-request.js replay"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
