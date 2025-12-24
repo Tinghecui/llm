@@ -89,8 +89,41 @@ llm-logs/logs/{date}/{request_id}.json
   - `FULL_REQUEST` - 请求详情
   - `RESPONSE` - 响应状态
   - `HEALTH_CHECK_MOCK` - 健康检查被 mock
+  - `HEALTH_CHECK` - 定时健康检查结果
   - `R2_SAVED` - R2 存储成功
   - `R2_SAVE_ERROR` - R2 存储失败
+
+### 6. 定时健康检查 + 状态页面
+每 5 分钟自动检测 anyrouter.top 是否可用，结果存储到 R2，提供网页查看。
+
+**检查请求：**
+```json
+{
+  "model": "claude-opus-4-5-20251101",
+  "messages": [{ "role": "user", "content": "你好你是谁" }],
+  "max_tokens": 100
+}
+```
+
+**判断标准：**
+- `status === 200` → 正常
+- `status !== 200` → 故障
+- 网络错误 → 故障
+
+**访问方式：**
+- 状态页面：`https://api.cthlwy.social/health`
+- API 数据：`https://api.cthlwy.social/health/api`
+
+**页面展示：**
+- 当前状态（正常/故障）
+- 可用率统计
+- 平均延迟
+- 最近 50 条检查记录
+
+**需要配置 Secret：**
+```bash
+wrangler secret put HEALTH_CHECK_KEY  # 健康检查用的 API Key
+```
 
 ---
 
@@ -237,6 +270,16 @@ GitHub Actions 自动化流程（`.github/workflows/ci.yml`）：
 ---
 
 ## 更新历史
+
+### 2025-12-25 (v3)
+1. **添加定时健康检查**
+   - 每 5 分钟检测 anyrouter.top 可用性
+   - 使用 Cloudflare Cron Triggers
+   - 结果存储到 R2（`health/` 目录）
+2. **添加健康状态页面**
+   - `/health` 查看状态和历史
+   - `/health/api` 获取 JSON 数据
+   - 显示可用率和平均延迟
 
 ### 2025-12-25 (v2)
 1. **添加健康检查请求识别和 Mock 响应**

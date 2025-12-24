@@ -18,3 +18,7 @@ binding = "LOGS_BUCKET"
 # routes = [
 #   { pattern = "api.cthlwy.social/*", zone_name = "cthlwy.social" }
 # ]
+
+# 定时任务 - 每 5 分钟健康检查
+[triggers]
+crons = ["*/5 * * * *"]

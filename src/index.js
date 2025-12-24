@@ -247,6 +247,16 @@ function createStreamProcessor(requestId, bodyContent, startTime, env, ctx) {
 // 主入口
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url)
+
+    // 健康检查页面
+    if (url.pathname === '/health') {
+      return renderHealthPage()
+    }
+    if (url.pathname === '/health/api') {
+      return getHealthHistory(env)
+    }
+
     const requestId = crypto.randomUUID()
     const startTime = Date.now()
 
@@ -371,6 +381,12 @@ export default {
 
     // 不需要存储的请求，直接返回
     return response
+  },
+
+  // 定时健康检查
+  async scheduled(event, env, ctx) {
+    const result = await performHealthCheck(env)
+    await saveHealthResult(env, result)
   }
 }
 
@@ -397,5 +413,144 @@ function buildTargetRequest(request, requestBody) {
     headers,
     body: requestBody,
     redirect: "manual"
+  })
+}
+
+// 健康检查
+async function performHealthCheck(env) {
+  const startTime = Date.now()
+
+  try {
+    const response = await fetch('https://anyrouter.top/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': env.HEALTH_CHECK_KEY,
+        ...CONFIG.INJECT_HEADERS
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-5-20251101',
+        messages: [{ role: 'user', content: '你好你是谁' }],
+        max_tokens: 100
+      })
+    })
+
+    return {
+      ok: response.status === 200,
+      status: response.status,
+      latency: Date.now() - startTime,
+      timestamp: new Date().toISOString()
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: error.message,
+      latency: Date.now() - startTime,
+      timestamp: new Date().toISOString()
+    }
+  }
+}
+
+async function saveHealthResult(env, result) {
+  const key = `health/${result.timestamp}.json`
+  await env.LOGS_BUCKET.put(key, JSON.stringify(result), {
+    httpMetadata: { contentType: 'application/json' }
+  })
+  console.log(JSON.stringify({ type: 'HEALTH_CHECK', ...result }))
+}
+
+// 健康检查页面
+function renderHealthPage() {
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+  <title>anyrouter 健康状态</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #333; }
+    .summary { display: flex; gap: 20px; margin-bottom: 20px; }
+    .card { background: white; padding: 20px; border-radius: 8px; flex: 1; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .ok { color: #22c55e; }
+    .fail { color: #ef4444; }
+    table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; }
+    th { background: #f8f9fa; text-align: left; padding: 12px; }
+    td { padding: 12px; border-top: 1px solid #eee; }
+    .status-badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+    .status-ok { background: #dcfce7; color: #166534; }
+    .status-fail { background: #fee2e2; color: #991b1b; }
+  </style>
+</head>
+<body>
+  <h1>anyrouter.top 健康状态</h1>
+  <div class="summary">
+    <div class="card">
+      <div>当前状态</div>
+      <div id="current" style="font-size: 24px;">-</div>
+    </div>
+    <div class="card">
+      <div>可用率</div>
+      <div id="uptime" style="font-size: 24px;">-</div>
+    </div>
+    <div class="card">
+      <div>平均延迟</div>
+      <div id="latency" style="font-size: 24px;">-</div>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>时间</th><th>状态</th><th>HTTP</th><th>延迟</th></tr></thead>
+    <tbody id="history"></tbody>
+  </table>
+  <script>
+    fetch('/health/api')
+      .then(r => r.json())
+      .then(data => {
+        if (data.length === 0) {
+          document.getElementById('history').innerHTML = '<tr><td colspan="4">暂无数据</td></tr>'
+          return
+        }
+        const okCount = data.filter(r => r.ok).length
+        const uptime = ((okCount / data.length) * 100).toFixed(1)
+        const avgLatency = Math.round(data.reduce((a, r) => a + r.latency, 0) / data.length)
+        const latest = data[0]
+
+        document.getElementById('current').innerHTML = latest.ok
+          ? '<span class="ok">正常</span>'
+          : '<span class="fail">故障</span>'
+        document.getElementById('uptime').textContent = uptime + '%'
+        document.getElementById('latency').textContent = avgLatency + 'ms'
+
+        document.getElementById('history').innerHTML = data.map(r => \`
+          <tr>
+            <td>\${new Date(r.timestamp).toLocaleString('zh-CN')}</td>
+            <td><span class="status-badge \${r.ok ? 'status-ok' : 'status-fail'}">\${r.ok ? '正常' : '故障'}</span></td>
+            <td>\${r.status}</td>
+            <td>\${r.latency}ms</td>
+          </tr>
+        \`).join('')
+      })
+  </script>
+</body>
+</html>`
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+}
+
+async function getHealthHistory(env) {
+  const list = await env.LOGS_BUCKET.list({ prefix: 'health/', limit: 100 })
+
+  const results = await Promise.all(
+    list.objects
+      .sort((a, b) => b.key.localeCompare(a.key))
+      .slice(0, 50)
+      .map(async obj => {
+        const data = await env.LOGS_BUCKET.get(obj.key)
+        return data ? JSON.parse(await data.text()) : null
+      })
+  )
+
+  return new Response(JSON.stringify(results.filter(Boolean)), {
+    headers: { 'Content-Type': 'application/json' }
   })
 }
