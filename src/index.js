@@ -154,8 +154,8 @@ function mergeContent(chunks) {
   return result
 }
 
-// 创建流式响应处理器
-function createStreamProcessor(requestId, bodyContent, startTime, env, ctx) {
+// 后台处理日志流（使用 tee() 的副本流）
+async function processLogStreamInBackground(logStream, requestId, bodyContent, startTime, env) {
   let fullContent = []
   let inputTokens = 0
   let outputTokens = 0
@@ -164,13 +164,16 @@ function createStreamProcessor(requestId, bodyContent, startTime, env, ctx) {
   const decoder = new TextDecoder()
   let buffer = ''
 
-  const transformer = new TransformStream({
-    transform(chunk, controller) {
-      // 直接透传给客户端
-      controller.enqueue(chunk)
+  try {
+    // 读取流并解析 SSE 事件
+    const reader = logStream.getReader()
 
-      // 同时解析 SSE 事件
-      buffer += decoder.decode(chunk, { stream: true })
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      // 解析 SSE 事件
+      buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() || ''
 
@@ -209,39 +212,41 @@ function createStreamProcessor(requestId, bodyContent, startTime, env, ctx) {
           } catch {}
         }
       }
-    },
-
-    flush(controller) {
-      // 流结束后，异步保存到 R2
-      ctx.waitUntil(saveToR2(env, {
-        request_id: requestId,
-        timestamp: new Date().toISOString(),
-        latency: Date.now() - startTime,
-        status: 200,
-        request: {
-          model: bodyContent.model,
-          messages: bodyContent.messages,
-          system: bodyContent.system,
-          max_tokens: bodyContent.max_tokens,
-          temperature: bodyContent.temperature,
-          thinking: bodyContent.thinking,
-          tools: bodyContent.tools,
-          metadata: bodyContent.metadata,
-          stream: bodyContent.stream
-        },
-        response: {
-          content: mergeContent(fullContent),
-          stop_reason: stopReason,
-          usage: {
-            input_tokens: inputTokens,
-            output_tokens: outputTokens
-          }
-        }
-      }))
     }
-  })
 
-  return transformer
+    // 保存到 R2
+    await saveToR2(env, {
+      request_id: requestId,
+      timestamp: new Date().toISOString(),
+      latency: Date.now() - startTime,
+      status: 200,
+      request: {
+        model: bodyContent.model,
+        messages: bodyContent.messages,
+        system: bodyContent.system,
+        max_tokens: bodyContent.max_tokens,
+        temperature: bodyContent.temperature,
+        thinking: bodyContent.thinking,
+        tools: bodyContent.tools,
+        metadata: bodyContent.metadata,
+        stream: bodyContent.stream
+      },
+      response: {
+        content: mergeContent(fullContent),
+        stop_reason: stopReason,
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens
+        }
+      }
+    })
+  } catch (error) {
+    console.log(JSON.stringify({
+      type: 'LOG_PROCESSING_ERROR',
+      request_id: requestId,
+      error: error.message
+    }))
+  }
 }
 
 // 主入口
@@ -283,7 +288,7 @@ export default {
       headers[key] = value
     }
 
-    // 输出完整请求到日志（用 wrangler tail 查看）
+    // 输出请求摘要到日志（用 wrangler tail 查看）
     console.log(JSON.stringify({
       type: "FULL_REQUEST",
       requestId,
@@ -291,7 +296,12 @@ export default {
       url: request.url,
       method: request.method,
       headers,
-      body: bodyContent,
+      bodyInfo: bodyContent && typeof bodyContent === 'object' ? {
+        model: bodyContent.model,
+        message_count: bodyContent.messages?.length,
+        stream: bodyContent.stream,
+        max_tokens: bodyContent.max_tokens
+      } : null,
       cf: request.cf ? {
         country: request.cf.country,
         city: request.cf.city,
@@ -322,7 +332,35 @@ export default {
     const targetRequest = buildTargetRequest(request, requestBody)
     const response = await fetch(targetRequest)
 
-    // 日志：请求完成
+    // 如果响应不是 200，记录错误并统一返回 429
+    if (response.status !== 200) {
+      const errorBody = await response.text()
+      console.log(JSON.stringify({
+        type: "ERROR_RESPONSE",
+        requestId,
+        status: response.status,
+        duration: Date.now() - startTime,
+        responseBody: errorBody.substring(0, 2000), // 截取前 2000 字符
+        isHtml: errorBody.trim().startsWith('<')
+      }))
+
+      // 统一返回 429
+      return new Response(JSON.stringify({
+        type: "error",
+        error: {
+          type: "rate_limit_error",
+          message: "Rate limit exceeded. Please try again later."
+        }
+      }), {
+        status: 429,
+        headers: {
+          "content-type": "application/json",
+          "retry-after": "60"
+        }
+      })
+    }
+
+    // 日志：请求完成（仅 200 响应）
     console.log(JSON.stringify({
       type: "RESPONSE",
       requestId,
@@ -330,19 +368,27 @@ export default {
       duration: Date.now() - startTime
     }))
 
-    // 只记录成功的响应（status === 200）
-    const shouldLog = response.status === 200
+    // 到这里一定是 200 响应
+    if (bodyContent?.stream === true) {
+      // 流式响应：使用 tee() 实现零拷贝直通 + 后台日志
+      const [clientStream, logStream] = response.body.tee()
 
-    if (shouldLog && bodyContent?.stream === true) {
-      // 流式响应：使用 TransformStream 处理
-      const processor = createStreamProcessor(requestId, bodyContent, startTime, env, ctx)
-      const transformedBody = response.body.pipeThrough(processor)
+      // 后台异步处理日志流（不阻塞客户端）
+      ctx.waitUntil(
+        processLogStreamInBackground(logStream, requestId, bodyContent, startTime, env)
+          .catch(err => console.log(JSON.stringify({
+            type: 'LOG_STREAM_ERROR',
+            request_id: requestId,
+            error: err.message
+          })))
+      )
 
-      return new Response(transformedBody, {
+      // 立即返回客户端流（零拷贝）
+      return new Response(clientStream, {
         status: response.status,
         headers: response.headers
       })
-    } else if (shouldLog && bodyContent && typeof bodyContent === 'object') {
+    } else if (bodyContent && typeof bodyContent === 'object') {
       // 非流式响应：直接读取 body
       const responseBody = await response.text()
 
@@ -408,6 +454,15 @@ function buildTargetRequest(request, requestBody) {
     headers.set(key, value)
   }
 
+  // 调试：记录转发请求的关键 headers
+  console.log(JSON.stringify({
+    type: "FORWARDED_HEADERS",
+    targetUrl: targetUrl.toString(),
+    userAgent: headers.get("user-agent"),
+    anthropicBeta: headers.get("anthropic-beta"),
+    xApp: headers.get("x-app")
+  }))
+
   return new Request(targetUrl.toString(), {
     method: request.method,
     headers,
@@ -424,8 +479,9 @@ async function performHealthCheck(env) {
     const response = await fetch('https://anyrouter.top/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': env.HEALTH_CHECK_KEY,
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'authorization': `Bearer ${env.HEALTH_CHECK_KEY}`,
         ...CONFIG.INJECT_HEADERS
       },
       body: JSON.stringify({

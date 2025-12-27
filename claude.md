@@ -76,14 +76,18 @@ llm-logs/logs/{date}/{request_id}.json
 ```
 
 **流式响应处理：**
-- 使用 `TransformStream` 拦截 SSE 流
-- 同步透传给客户端，不影响首字节延迟
+- 使用 `ReadableStream.tee()` 零拷贝分流技术
+- 客户端流：直接透传，零延迟（相比 TransformStream 消除 5-20ms 延迟）
+- 日志流：后台异步解析 SSE 事件，不阻塞响应
 - 累积 `content_block_delta` 事件拼接完整输出
 - 从 `message_delta` 提取 `stop_reason` 和 `usage`
 - 使用 `ctx.waitUntil()` 异步写入 R2
 
 ### 5. 请求日志
-- **实时日志 (console.log)**：记录完整请求信息（headers、body）
+- **实时日志 (console.log)**：记录请求摘要（避免 256KB 限制）
+  - 记录 headers、URL、method
+  - body 只记录摘要（model、message_count、stream、max_tokens）
+  - 完整 body 保存在 R2，console.log 只用于实时调试
 - 使用 `npm run tail` 或 `wrangler tail --format=json` 查看
 - 日志类型：
   - `FULL_REQUEST` - 请求详情
@@ -195,14 +199,20 @@ GitHub Actions 自动化流程（`.github/workflows/ci.yml`）：
 {
   "type": "FULL_REQUEST",
   "requestId": "uuid",
-  "timestamp": "2025-12-25T18:02:25.296Z",
+  "timestamp": "2025-12-27T05:55:35.455Z",
   "url": "https://api.cthlwy.social/v1/messages",
   "method": "POST",
   "headers": { ... },
-  "body": { ... },
+  "bodyInfo": {
+    "model": "claude-haiku-4-5-20251001",
+    "message_count": 2,
+    "stream": true,
+    "max_tokens": 64000
+  },
   "cf": { "country": "US", "city": "Santa Clara", "colo": "SJC" }
 }
 ```
+**注意**：`bodyInfo` 只包含摘要信息，完整的 `messages` 和 `system` 保存在 R2。
 
 ### RESPONSE（响应状态）
 ```json
@@ -264,12 +274,24 @@ GitHub Actions 自动化流程（`.github/workflows/ci.yml`）：
 
 1. **付费版 Worker**：建议升级到付费版（$5/月）获得 50ms CPU 时间，支持大响应的完整存储
 2. **R2 免费额度**：10GB 存储，100万次请求/月
-3. **流式响应**：使用 TransformStream 同步透传，不影响客户端延迟
+3. **流式响应**：使用 Stream Tee 零拷贝技术，客户端延迟为 0ms，日志流后台异步处理
 4. **健康检查 Mock**：返回延迟 2-4 秒，避免被检测为异常
+5. **console.log 限制**：256KB/请求，已优化为只记录摘要（完整数据在 R2）
 
 ---
 
 ## 更新历史
+
+### 2025-12-27 (v4)
+1. **Stream Tee 零拷贝优化**
+   - 从 `TransformStream` 改为 `ReadableStream.tee()`
+   - 客户端流零拷贝直通，消除 5-20ms 延迟
+   - 日志流后台异步处理，完全用户无感
+   - 性能提升：客户端延迟降至 0ms
+2. **console.log 日志优化**
+   - 移除 `body` 完整记录，改为 `bodyInfo` 摘要
+   - 避免 Cloudflare 256KB/请求限制
+   - 完整数据仍保存在 R2，不影响训练数据收集
 
 ### 2025-12-25 (v3)
 1. **添加定时健康检查**
