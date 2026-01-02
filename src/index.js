@@ -23,6 +23,12 @@ const CONFIG = {
   }
 }
 
+// 把 messages 的 content 替换成 *
+function summarizeMessages(messages) {
+  if (!messages || !Array.isArray(messages)) return null
+  return messages.map(m => ({ role: m.role, content: "*" }))
+}
+
 // 检测是否为健康检查请求（9个特征全部匹配）
 function isHealthCheckRequest(body, headers) {
   if (!body || !body.messages || !Array.isArray(body.messages)) {
@@ -214,6 +220,24 @@ async function processLogStreamInBackground(logStream, requestId, bodyContent, s
       }
     }
 
+    const mergedContent = mergeContent(fullContent)
+
+    // 记录流式响应到 console.log
+    console.log(JSON.stringify({
+      type: "SUCCESS_RESPONSE",
+      requestId,
+      status: 200,
+      duration: Date.now() - startTime,
+      response: {
+        content: mergedContent,
+        stop_reason: stopReason,
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: outputTokens
+        }
+      }
+    }))
+
     // 保存到 R2
     await saveToR2(env, {
       request_id: requestId,
@@ -232,7 +256,7 @@ async function processLogStreamInBackground(logStream, requestId, bodyContent, s
         stream: bodyContent.stream
       },
       response: {
-        content: mergeContent(fullContent),
+        content: mergedContent,
         stop_reason: stopReason,
         usage: {
           input_tokens: inputTokens,
@@ -288,7 +312,7 @@ export default {
       headers[key] = value
     }
 
-    // 输出请求摘要到日志（用 wrangler tail 查看）
+    // 输出请求日志（用 wrangler tail 查看）
     console.log(JSON.stringify({
       type: "FULL_REQUEST",
       requestId,
@@ -296,12 +320,17 @@ export default {
       url: request.url,
       method: request.method,
       headers,
-      bodyInfo: bodyContent && typeof bodyContent === 'object' ? {
+      body: bodyContent && typeof bodyContent === 'object' ? {
         model: bodyContent.model,
-        message_count: bodyContent.messages?.length,
-        stream: bodyContent.stream,
-        max_tokens: bodyContent.max_tokens
-      } : null,
+        messages: summarizeMessages(bodyContent.messages),
+        system: bodyContent.system,
+        max_tokens: bodyContent.max_tokens,
+        temperature: bodyContent.temperature,
+        thinking: bodyContent.thinking,
+        tools: bodyContent.tools,
+        metadata: bodyContent.metadata,
+        stream: bodyContent.stream
+      } : bodyContent,
       cf: request.cf ? {
         country: request.cf.country,
         city: request.cf.city,
@@ -420,6 +449,19 @@ export default {
 
       try {
         const responseData = JSON.parse(responseBody)
+
+        // 记录成功响应到 console.log
+        console.log(JSON.stringify({
+          type: "SUCCESS_RESPONSE",
+          requestId,
+          status: response.status,
+          duration: Date.now() - startTime,
+          response: {
+            content: responseData.content,
+            stop_reason: responseData.stop_reason,
+            usage: responseData.usage
+          }
+        }))
 
         ctx.waitUntil(saveToR2(env, {
           request_id: requestId,
