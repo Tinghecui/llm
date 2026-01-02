@@ -332,7 +332,7 @@ export default {
     const targetRequest = buildTargetRequest(request, requestBody)
     const response = await fetch(targetRequest)
 
-    // 如果响应不是 200，记录错误并统一返回 429
+    // 如果响应不是 200，记录错误
     if (response.status !== 200) {
       const errorBody = await response.text()
       console.log(JSON.stringify({
@@ -341,23 +341,50 @@ export default {
         status: response.status,
         duration: Date.now() - startTime,
         responseBody: errorBody.substring(0, 2000), // 截取前 2000 字符
-        isHtml: errorBody.trim().startsWith('<')
+        isHtml: errorBody.trim().startsWith('<'),
+        maskErrorsConfig: env.MASK_ERRORS
       }))
 
-      // 统一返回 429
-      return new Response(JSON.stringify({
-        type: "error",
-        error: {
-          type: "rate_limit_error",
-          message: "Rate limit exceeded. Please try again later."
-        }
-      }), {
-        status: 429,
-        headers: {
-          "content-type": "application/json",
-          "retry-after": "60"
-        }
-      })
+      // 500 错误统一返回 429
+      if (response.status === 500) {
+        return new Response(JSON.stringify({
+          type: "error",
+          error: {
+            type: "rate_limit_error",
+            message: "Rate limit exceeded. Please try again later."
+          }
+        }), {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "60"
+          }
+        })
+      }
+
+      // 其他错误根据 MASK_ERRORS 环境变量决定
+      const shouldMaskErrors = env.MASK_ERRORS === true || env.MASK_ERRORS === "true"
+      if (shouldMaskErrors) {
+        return new Response(JSON.stringify({
+          type: "error",
+          error: {
+            type: "rate_limit_error",
+            message: "Rate limit exceeded. Please try again later."
+          }
+        }), {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "60"
+          }
+        })
+      } else {
+        // 透传原始错误
+        return new Response(errorBody, {
+          status: response.status,
+          headers: response.headers
+        })
+      }
     }
 
     // 日志：请求完成（仅 200 响应）
