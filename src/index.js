@@ -345,19 +345,18 @@ export default {
         maskErrorsConfig: env.MASK_ERRORS
       }))
 
-      // 500 错误统一返回 429
+      // 500 错误返回未授权访问提示
       if (response.status === 500) {
         return new Response(JSON.stringify({
           type: "error",
           error: {
-            type: "rate_limit_error",
-            message: "Rate limit exceeded. Please try again later."
+            type: "authentication_error",
+            message: "未授权访问。此 API 端点仅限 Claude Code 客户端使用，请通过官方 Claude Code CLI 访问。"
           }
         }), {
-          status: 429,
+          status: 500,
           headers: {
-            "content-type": "application/json",
-            "retry-after": "60"
+            "content-type": "application/json"
           }
         })
       }
